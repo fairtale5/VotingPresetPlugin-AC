@@ -87,6 +87,8 @@ public class VotingPresetPlugin : BackgroundService
     private int _onDemandNoCount;
     /// <summary>Clients who have already voted in the current on-demand vote (one vote per client).</summary>
     private readonly List<ACTcpClient> _onDemandVoted = new();
+    /// <summary>Last time we broadcasted an on-demand vote status line (start message, vote update, or reminder). Used for 30s reminder timing.</summary>
+    private DateTime _onDemandLastBroadcastTime;
 
     // --- Cooldown: block requester from starting another on-demand vote after a failed one ---
     /// <summary>Maps client to UTC time when their cooldown ends (after they started an on-demand vote that failed). Checked before starting a new on-demand vote.</summary>
@@ -170,25 +172,35 @@ public class VotingPresetPlugin : BackgroundService
     }
 
     /// <summary>
-    /// Reply to context with all admin presets: one line "List of all presets:", then for each index i in _adminPresets reply " /presetuse {i} - {Name}" (Name = _adminPresets[i].Name).
+    /// Reply with votable presets for /preset: "To start a vote: /preset &lt;number&gt;" then for each i in _votePresets reply " /preset {i} - {Name}" (votable presets only).
+    /// If context.IsAdministrator, also add "Restricted presets use: /presetset &lt;number&gt;" and, for each i where _adminPresets[i] is not in _votePresets, reply " /presetset {i} - {Name}".
+    /// This keeps /preset indices for players and /presetset indices for admins aligned with the underlying preset lists.
     /// </summary>
     internal void ListAllPresets(BaseCommandContext context)
     {
-        context.Reply("List of all presets:");
+        context.Reply("To start a vote: /preset <number>");
+        for (int i = 0; i < _votePresets.Count; i++)
+            context.Reply($" /preset {i} - {_votePresets[i].Name}");
+
+        if (!context.IsAdministrator) return;
+
+        context.Reply("Restricted presets use: /presetset <number>");
         for (int i = 0; i < _adminPresets.Count; i++)
         {
-            var pt = _adminPresets[i];
-            context.Reply($" /presetuse {i} - {pt.Name}");
+            var adminPreset = _adminPresets[i];
+            if (_votePresets.Any(v => v.Equals(adminPreset))) continue;
+            context.Reply($" /presetset {i} - {adminPreset.Name}");
         }
     }
 
     /// <summary>
-    /// Reply with current preset: read _presetManager.CurrentPreset.Type.Name and .PresetFolder, log them and send same text to context.Reply.
+    /// Reply with current preset: read _presetManager.CurrentPreset.Type.Name and .PresetFolder, log them and send same text to context.Reply; then send "Use /presets to list all presets." Used by /preset with no args.
     /// </summary>
     internal void GetPreset(BaseCommandContext context)
     {
         Log.Information("Current preset: {Name} - {PresetFolder}", _presetManager.CurrentPreset.Type!.Name, _presetManager.CurrentPreset.Type!.PresetFolder);
         context.Reply($"Current preset: {_presetManager.CurrentPreset.Type!.Name} - {_presetManager.CurrentPreset.Type!.PresetFolder}");
+        context.Reply("Use /presets to list all presets.");
     }
 
     /// <summary>
@@ -208,7 +220,7 @@ public class VotingPresetPlugin : BackgroundService
         }
         else if (_voteState == VoteState.TimerVote)
         {
-            context.Reply("Timer vote in progress. Use /vt <number> to vote.");
+            context.Reply("Timer vote in progress. Use /vote <number> to vote.");
         }
 
         context.Reply("Votable presets:");
@@ -256,26 +268,43 @@ public class VotingPresetPlugin : BackgroundService
         _onDemandNoCount = 0;
 
         var abstained = _entryCarManager.ConnectedCars.Count - 1;
+        _onDemandLastBroadcastTime = DateTime.UtcNow;
         _entryCarManager.BroadcastChat($"Change to {target.Name}? /yes /no ({_configuration.VotingDurationSeconds}s) — Yes: 1, No: 0, —: {abstained}");
         _ = RunOnDemandVoteAsync();
     }
 
     /// <summary>
-    /// Background loop for the current on-demand vote: wait until _onDemandEndTime, broadcast a reminder every 30s with time left and counts; then evaluate yes vs no, apply preset or cooldown, set _voteState = Idle.
+    /// Background loop for the current on-demand vote: wait until _onDemandEndTime, send a reminder when 30s have passed since the last broadcast, and end early when the result is decided (yes has majority or no cannot lose).
+    /// Then evaluate yes vs no, apply preset or cooldown, and set _voteState = Idle.
     /// </summary>
     private async Task RunOnDemandVoteAsync()
     {
-        var lastReminder = DateTime.UtcNow;
         while (DateTime.UtcNow < _onDemandEndTime && _voteState == VoteState.OnDemandVote)
         {
             await Task.Delay(1000, _cancellationToken);
             if (_voteState != VoteState.OnDemandVote) return;
-            if ((DateTime.UtcNow - lastReminder).TotalSeconds >= 30 && _onDemandTargetPreset != null)
+            if (_onDemandTargetPreset != null)
             {
-                lastReminder = DateTime.UtcNow;
-                var s = Math.Max(0, (int)(_onDemandEndTime - DateTime.UtcNow).TotalSeconds);
-                var abstained = _entryCarManager.ConnectedCars.Count - _onDemandVoted.Count;
-                _entryCarManager.BroadcastChat($"{_onDemandTargetPreset.Name} vote: {s}s left — Yes: {_onDemandYesCount}, No: {_onDemandNoCount}, —: {abstained}");
+                var total = _entryCarManager.ConnectedCars.Count;
+                var yesCount = _onDemandYesCount;
+                var noCount = _onDemandNoCount;
+
+                if (total > 0)
+                {
+                    // Early end: yes has strict majority, or no has at least half so yes cannot reach majority.
+                    if (yesCount * 2 > total || noCount * 2 >= total)
+                    {
+                        break;
+                    }
+                }
+
+                if ((DateTime.UtcNow - _onDemandLastBroadcastTime).TotalSeconds >= 30)
+                {
+                    _onDemandLastBroadcastTime = DateTime.UtcNow;
+                    var s = Math.Max(0, (int)(_onDemandEndTime - DateTime.UtcNow).TotalSeconds);
+                    var abstained = total - _onDemandVoted.Count;
+                    _entryCarManager.BroadcastChat($"{_onDemandTargetPreset.Name} vote: {s}s left — Yes: {_onDemandYesCount}, No: {_onDemandNoCount}, —: {abstained}");
+                }
             }
         }
         if (_voteState != VoteState.OnDemandVote) return;
@@ -314,6 +343,7 @@ public class VotingPresetPlugin : BackgroundService
 
     /// <summary>
     /// Record one player's yes or no during an on-demand vote. Reject if not OnDemandVote or already voted; else add to _onDemandVoted and increment _onDemandYesCount or _onDemandNoCount.
+    /// Also broadcast updated counts to all players and reset the 30s reminder timer.
     /// </summary>
     internal void VoteOnDemand(ChatCommandContext context, bool isYes)
     {
@@ -333,6 +363,13 @@ public class VotingPresetPlugin : BackgroundService
         else
             _onDemandNoCount++;
         context.Reply("Your vote has been counted.");
+        if (_onDemandTargetPreset != null)
+        {
+            _onDemandLastBroadcastTime = DateTime.UtcNow;
+            var s = Math.Max(0, (int)(_onDemandEndTime - DateTime.UtcNow).TotalSeconds);
+            var abstained = _entryCarManager.ConnectedCars.Count - _onDemandVoted.Count;
+            _entryCarManager.BroadcastChat($"{_onDemandTargetPreset.Name} vote: {s}s left — Yes: {_onDemandYesCount}, No: {_onDemandNoCount}, —: {abstained}");
+        }
     }
 
     /// <summary>
@@ -593,7 +630,7 @@ public class VotingPresetPlugin : BackgroundService
             _availablePresets.Add(new PresetChoice { Preset = last.Type, Votes = 0 });
             if (_configuration.EnableVote || manualVote)
             {
-                _entryCarManager.BroadcastChat(" /vt 0 - Stay on current track.");
+                _entryCarManager.BroadcastChat(" /vote 0 - Stay on current track.");
             }
         }
         for (int i = _availablePresets.Count; i < _configuration.VoteChoices; i++)
@@ -606,7 +643,7 @@ public class VotingPresetPlugin : BackgroundService
 
             if (_configuration.EnableVote || manualVote)
             {
-                _entryCarManager.BroadcastChat($" /vt {i} - {nextPreset.Name}");
+                _entryCarManager.BroadcastChat($" /vote {i} - {nextPreset.Name}");
             }
         }
 

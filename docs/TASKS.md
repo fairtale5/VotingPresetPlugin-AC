@@ -61,22 +61,21 @@ One document: plan (command simplification, 30s reminder, early end) and impleme
 
 ---
 
-## 4. Open point (to decide in implementation)
+## 4. Resolved: /presets visibility
 
-- **/presets** today is admin-only. If it stays admin-only, players don’t see which **number** to use for **/preset &lt;number&gt;** unless we show votable numbers somewhere else (e.g. in **/preset** no-args, or in the on-demand vote start message). Options: (A) Make **/presets** available to all so everyone can see the list and the numbers, or (B) Keep **/presets** admin-only and add votable preset numbers (and names) to **/preset** no-args or to the “Vote to change to &lt;Name&gt;” message. Decide when implementing.
-
+- **/presets** is available to all (RequireConnectedPlayer only). Players see votable presets with " /preset {i} - {Name}". Admins see that plus "Admin: set preset: /presetset &lt;number&gt;" and full list " /presetset {i} - {Name}". don’t see which **number** to use for **/preset &lt;number&gt;** unless we show votable numbers somewhere else (e.g. in **/preset** no-args, or in the on-demand vote start message). Options: (A) Make **/presets** available to all so everyone can see the list and the numbers, or (B) Keep **/presets** admin-only and add votable preset numbers (and names) to **/preset** no-args or to the “Vote to change to &lt;Name&gt;” message.
 ---
 
 ## 5. Implementation checklist
 
-- [ ] **Commands:** In `VotingPresetCommandModule.cs`, apply the mapping in section 1. Single name per command; remove all aliases. Rename handler references if needed (e.g. StartVote → still called from **votestart**).
-- [ ] **/preset (no args):** Change reply to current preset only + “Use /presets to list all presets.” No list of votable presets.
-- [ ] **/presets:** Ensure reply includes “Use /preset &lt;number&gt; to start a vote to switch to that preset.” Decide admin-only vs all (see open point).
-- [ ] **VoteOnDemand:** After recording a vote, **broadcast** one line with time left and Yes/No counts. Ensure this broadcast is used as “last update” for the 30s reminder.
-- [ ] **RunOnDemandVoteAsync:** Use “30s since last broadcast” for reminder: maintain last-broadcast time; set it at vote start and on every broadcast (vote update or reminder); send reminder only when ≥30s since last broadcast.
-- [ ] **Early end:** In on-demand loop (and optionally in VoteOnDemand after broadcast), check `yes_count > total_online/2` (yes wins) and `no_count >= total_online/2` (no wins). If either, exit loop and apply result (preset change or cooldown).
-- [ ] **Timer vote broadcast:** When broadcasting timer vote options, use **/vote &lt;number&gt;** in the text (e.g. “/vote 0 - Stay on current track”, “/vote 1 - &lt;Name&gt;”) instead of /vt.
-- [ ] **Docs:** README and this file are the only two; no new docs. (COMMANDS, STRUCTURE, AC_VOTE_SHORTCUTS merged or removed.)
+- [x] **Commands:** In `VotingPresetCommandModule.cs`, apply the mapping in section 1. Single name per command; remove all aliases. Rename handler references if needed (e.g. StartVote → still called from **votestart**).
+- [x] **/preset (no args):** Change reply to current preset only + “Use /presets to list all presets.” No list of votable presets.
+- [x] **/presets:** First line "To start a vote: /preset &lt;number&gt;"; each line " /preset {i} - {Name}". Admin-only unchanged (see open point). Ensure reply “Use /preset &lt;number&gt; to start a vote to switch to that preset.” Decide admin-only vs all (see open point).
+- [x] **VoteOnDemand:** After recording a vote, **broadcast** one line with time left and Yes/No counts. Ensure this broadcast is used as “last update” for the 30s reminder.
+- [x] **RunOnDemandVoteAsync:** Use “30s since last broadcast” for reminder: maintain last-broadcast time; set it at vote start and on every broadcast (vote update or reminder); send reminder only when ≥30s since last broadcast.
+- [x] **Early end:** In on-demand loop (and optionally in VoteOnDemand after broadcast), check `yes_count > total_online/2` (yes wins) and `no_count >= total_online/2` (no wins). If either, exit loop and apply result (preset change or cooldown).
+- [x] **Timer vote broadcast:** When broadcasting timer vote options, use **/vote &lt;number&gt;** in the text (e.g. “/vote 0 - Stay on current track”, “/vote 1 - &lt;Name&gt;”) instead of /vt.
+- [x] **Docs:** README and this file are the only two; no new docs. (COMMANDS, STRUCTURE, AC_VOTE_SHORTCUTS merged or removed.)
 
 ---
 

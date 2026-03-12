@@ -17,7 +17,7 @@ AssettoServer plugin for preset (track/config) voting. Lets the server rotate pr
 |--------|-----|--------------|
 | **/preset** | Player | Show current preset name. Reply: “Use /presets to list all presets.” |
 | **/preset &lt;number&gt;** | Player | Start on-demand vote for preset at that index. Reject if vote running, invalid index, or requester on cooldown. |
-| **/presets** | Admin | List all presets (number + name). Reply: “Use /preset &lt;number&gt; to start a vote to switch.” |
+| **/presets** | Player / Admin | Votable presets (for /preset). Admins also see full list (for /presetset). |
 | **/vote &lt;number&gt;** | Player | During **timer vote** only: cast vote for that option. If no timer vote: “There is no ongoing track vote.” |
 | **/yes**, **/y** | Player | During on-demand vote: vote yes. |
 | **/no**, **/n** | Player | During on-demand vote: vote no. |
@@ -84,7 +84,7 @@ AssettoServer plugin for preset (track/config) voting. Lets the server rotate pr
 
 - **Command simplification:** Finish renaming and de-aliasing (votetrack → /vote &lt;number&gt;, presetshow → /preset, presetlist → /presets, presetstartvote → votestart, etc.). See `docs/TASKS.md` §1.
 - **On-demand behaviour:** 30s reminder “since last broadcast”; broadcast counts when someone votes; early end when majority yes or no. See `docs/TASKS.md` §2–3.
-- **/presets visibility:** Decide whether /presets is admin-only or available to all so players can see preset numbers for /preset &lt;number&gt;. See `docs/TASKS.md` §4.
+- **/presets visibility:** Resolved: /presets is available to all; players see votable list, admins see that plus full list for /presetset. See `docs/TASKS.md` §4.
 - **Vote shortcuts:** Re-investigate whether in-game Y/N (or Ctrl+Y/N) can be used for our preset vote; currently we rely on chat only. See `docs/WHY_CHAT_ONLY_NOT_SHORTCUTS.md` and `docs/TASKS.md` for context.
 
 Full checklist and implementation details are in **docs/TASKS.md**.
