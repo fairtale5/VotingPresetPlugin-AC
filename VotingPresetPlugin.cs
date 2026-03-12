@@ -546,7 +546,7 @@ public class VotingPresetPlugin : BackgroundService
 
     /// <summary>
     /// Run one full timer vote: build options, broadcast, wait for votes, pick winner, apply or stay.
-    /// 1) If _voteState != Idle, return immediately. 2) Set _voteState = TimerVote. 3) last = _presetManager.CurrentPreset. 4) Clear _availablePresets and _alreadyVoted. 5) presetsLeft = copy of _votePresets with last.Type removed (so we only offer other presets). If presetsLeft.Count &lt;= 1, log "Not enough presets", set _voteState = Idle, return. 6) If EnableVote or manualVote: broadcast "Vote for next track:". 7) If EnableStayOnTrack: add PresetChoice(last.Type, Votes=0) to _availablePresets; if voting enabled broadcast " /vt 0 - Stay on current track.". 8) For i from _availablePresets.Count to VoteChoices-1: if presetsLeft empty break; nextPreset = random from presetsLeft; add PresetChoice(nextPreset, 0) to _availablePresets; remove nextPreset from presetsLeft; if voting enabled broadcast " /vt {i} - {nextPreset.Name}". 9) If EnableVote or manualVote: await WaitVoting(stoppingToken); if it returns false, set _voteState = Idle and return (vote canceled). 10) maxVotes = max of w.Votes in _availablePresets; presets = all PresetChoice where Votes == maxVotes; winner = random from presets. 11) If winner.Preset equals last.Type, or (maxVotes == 0 and !ChangePresetWithoutVotes): broadcast "Staying on track for {IntervalMinutes} more minutes.". 12) Else: broadcast winner and "Track will change in ..."; await Delay(TransitionDelayMilliseconds); call _presetManager.SetPreset(PresetData(last.Type, winner.Preset, TransitionDurationSeconds)). 13) Set _voteState = Idle.
+    /// 1) If _voteState != Idle, return immediately. 2) Set _voteState = TimerVote. 3) last = _presetManager.CurrentPreset. 4) Clear _availablePresets and _alreadyVoted. 5) presetsLeft = copy of _votePresets with last.Type removed (so we only offer other presets). If presetsLeft.Count == 0: log "Not enough presets", set Idle, return. If presetsLeft.Count == 1: log and broadcast "only one other preset, changing without a vote", delay and SetPreset, set Idle, return. 6) If EnableVote or manualVote: broadcast "Vote for next track:". 7) If EnableStayOnTrack: add PresetChoice(last.Type, Votes=0) to _availablePresets; if voting enabled broadcast " /vt 0 - Stay on current track.". 8) For i from _availablePresets.Count to VoteChoices-1: if presetsLeft empty break; nextPreset = random from presetsLeft; add PresetChoice(nextPreset, 0) to _availablePresets; remove nextPreset from presetsLeft; if voting enabled broadcast " /vt {i} - {nextPreset.Name}". 9) If EnableVote or manualVote: await WaitVoting(stoppingToken); if it returns false, set _voteState = Idle and return (vote canceled). 10) maxVotes = max of w.Votes in _availablePresets; presets = all PresetChoice where Votes == maxVotes; winner = random from presets. 11) If winner.Preset equals last.Type, or (maxVotes == 0 and !ChangePresetWithoutVotes): broadcast "Staying on track for {IntervalMinutes} more minutes.". 12) Else: broadcast winner and "Track will change in ..."; await Delay(TransitionDelayMilliseconds); call _presetManager.SetPreset(PresetData(last.Type, winner.Preset, TransitionDurationSeconds)). 13) Set _voteState = Idle.
     /// </summary>
     private async Task VotingAsync(CancellationToken stoppingToken, bool manualVote = false)
     {
@@ -561,9 +561,26 @@ public class VotingPresetPlugin : BackgroundService
 
         var presetsLeft = new List<PresetType>(_votePresets);
         presetsLeft.RemoveAll(t => t.Equals(last.Type!));
-        if (presetsLeft.Count <= 1)
+        if (presetsLeft.Count == 0)
         {
             Log.Warning("Not enough presets to start vote");
+            _voteState = VoteState.Idle;
+            return;
+        }
+        if (presetsLeft.Count == 1)
+        {
+            var next = presetsLeft[0];
+            Log.Information("Only one other preset found, changing without a vote to {Preset}", next.Name);
+            _entryCarManager.BroadcastChat($"Only one other track available. Changing to {next.Name} without a vote.");
+            _entryCarManager.BroadcastChat($"Track will change in {(_configuration.TransitionDelaySeconds < 60 ?
+                    $"{_configuration.TransitionDelaySeconds} second(s)" :
+                    $"{(int)Math.Ceiling(_configuration.TransitionDelaySeconds / 60.0)} minute(s)")}.");
+            try
+            {
+                await Task.Delay(_configuration.TransitionDelayMilliseconds, stoppingToken);
+                _presetManager.SetPreset(new PresetData(last.Type!, next) { TransitionDuration = _configuration.TransitionDurationSeconds });
+            }
+            catch (OperationCanceledException) { }
             _voteState = VoteState.Idle;
             return;
         }
