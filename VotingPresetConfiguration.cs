@@ -1,3 +1,6 @@
+/// <summary>
+/// Configuration for VotingPresetPlugin. Loaded from the server config (e.g. plugin_voting_preset_cfg.yml or main server YAML). Each property is read by the plugin: IntervalMinutes and VotingDurationSeconds drive ExecuteAsync and WaitVoting; VoteChoices and EnableStayOnTrack drive how many options are built in VotingAsync; TransitionDelaySeconds/TransitionDurationSeconds and TransitionDelayMilliseconds/TransitionDurationMilliseconds are used when applying a preset (AdminPreset and VotingAsync). RequesterCooldownMinutes is used to block the requester from starting another on-demand vote after a failed one. Meta holds preset-specific settings (Name, AdminOnly etc.) used by PresetConfigurationManager. Validation is done by VotingPresetConfigurationValidator (VoteChoices ≥ 2, IntervalMinutes ≥ 5, RequesterCooldownMinutes ≥ 0, etc.).
+/// </summary>
 using AssettoServer.Server.Configuration;
 using JetBrains.Annotations;
 using VotingPresetPlugin.Preset;
@@ -37,7 +40,10 @@ public class VotingPresetConfiguration : IValidateConfiguration<VotingPresetConf
     
     [YamlMember(Description = "Time between restart notification and restart. \nMinimum 2, Default 5")]
     public int TransitionDurationSeconds { get; init; } = 5;
-    
+
+    [YamlMember(Description = "After an on-demand vote fails, the player who started it cannot start another on-demand vote for this many minutes. \nMinimum 0, Default 15. Only used when on-demand votes are implemented.")]
+    public int RequesterCooldownMinutes { get; init; } = 15;
+
     [YamlMember(Description = "Preset specific settings \nThe cfg/ directory is always ignored for the presets pool.")]
     public PresetConfiguration Meta { get; init; } = new();
     
