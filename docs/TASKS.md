@@ -90,3 +90,6 @@ One document: plan (command simplification, 30s reminder, early end) and impleme
 ## 7. Future / optional
 
 - **Vote shortcuts:** Re-investigate whether in-game Y/N (or Ctrl+Y/N) or a CSP Lua UI can be used for preset yes/no once a vote is in progress. We use chat only because shortcuts didn’t show up in our packet captures. See **docs/WHY_CHAT_ONLY_NOT_SHORTCUTS.md**.
+- **PT-BR wording for players:** Add a pass to convert command-facing and status text to clearer Portuguese where desired (without breaking existing command names unless explicitly migrated).
+- **/yes / /no ease-of-use:** Keep compatibility, but evaluate simpler player flow (clearer prompts, shorter reminders, optional aliases like `/sim` and `/nao` if approved).
+- **Fake vote UI experiment:** Investigate if we can safely present native yes/no vote UI by emitting a synthetic vote type (session skip / kick-like packet flow) only as a frontend interaction layer for preset voting. Record protocol constraints and anti-abuse safeguards before any implementation.
