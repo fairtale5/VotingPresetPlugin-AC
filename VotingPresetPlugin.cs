@@ -110,7 +110,7 @@ public class VotingPresetPlugin : BackgroundService
     /// 5) If acServerConfiguration.Extra.EnableClientMessages and _configuration.EnableReconnect: load embedded resource "VotingPresetPlugin.lua.reconnectclient.lua" via Assembly.GetExecutingAssembly().GetManifestResourceStream, then scriptProvider.AddScript(stream, "reconnectclient.lua"); add CSP feature "FREQUENT_TRACK_CHANGES" to cspFeatureManager.
     /// </summary>
     public VotingPresetPlugin(VotingPresetConfiguration configuration,
-        PresetConfigurationManager presetConfigurationManager, 
+        PresetConfigurationManager presetConfigurationManager,
         ACServerConfiguration acServerConfiguration,
         EntryCarManager entryCarManager,
         PresetManager presetManager,
