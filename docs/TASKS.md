@@ -77,6 +77,10 @@ One document: plan (command simplification, 30s reminder, early end) and impleme
 - [x] **Timer vote broadcast:** When broadcasting timer vote options, use **/vote &lt;number&gt;** in the text (e.g. “/vote 0 - Stay on current track”, “/vote 1 - &lt;Name&gt;”) instead of /vt.
 - [x] **Docs:** README and this file are the only two; no new docs. (COMMANDS, STRUCTURE, AC_VOTE_SHORTCUTS merged or removed.)
 
+### Backlog (not in §5 above)
+
+- [ ] **§8 — First:** Lua vote UI foundation — two-way CSP **OnlineEvent** channel (see **§8, First**). Then §8.1–8.4 as needed.
+
 ---
 
 ## 6. Done / unchanged
@@ -89,7 +93,68 @@ One document: plan (command simplification, 30s reminder, early end) and impleme
 
 ## 7. Future / optional
 
-- **Vote shortcuts:** Re-investigate whether in-game Y/N (or Ctrl+Y/N) or a CSP Lua UI can be used for preset yes/no once a vote is in progress. We use chat only because shortcuts didn’t show up in our packet captures. See **docs/WHY_CHAT_ONLY_NOT_SHORTCUTS.md**.
+- **Vote shortcuts / UI:** Chat-only history in **docs/WHY_CHAT_ONLY_NOT_SHORTCUTS.md**. **Concrete implementation path:** §8 **First** (CSP packets + Lua); keybinds/UI built on top of that channel.
 - **PT-BR wording for players:** Add a pass to convert command-facing and status text to clearer Portuguese where desired (without breaking existing command names unless explicitly migrated).
 - **/yes / /no ease-of-use:** Keep compatibility, but evaluate simpler player flow (clearer prompts, shorter reminders, optional aliases like `/sim` and `/nao` if approved).
 - **Fake vote UI experiment:** Investigate if we can safely present native yes/no vote UI by emitting a synthetic vote type (session skip / kick-like packet flow) only as a frontend interaction layer for preset voting. Record protocol constraints and anti-abuse safeguards before any implementation.
+
+---
+
+## 8. Planned enhancements (backlog)
+
+Backlog for behaviour **not** covered by §5. Same shape as §2–§3: **What**, **Why**, **How (technical)** — so we can implement later without re-deriving design.
+
+**Implement §8 “First” before 8.1–8.4** unless priorities change (packet channel is prerequisite for Lua UI + keybinds).
+
+**Overlap check (nothing below duplicates §2–§3 or §5):**  
+§2–§3 and the checklist already cover 30s-since-broadcast reminders, broadcast on `/yes`/`/no`, early end, and `/vote` timer text. **§8 First** adds CSP **bidirectional** messages (not chat). **8.1–8.4** add: minimum turnout, session gating, change-vote, shared chat formatter (§7 “shortcuts” is intentionally vague; §8 First is the actionable slice).
+
+### First: two-way VotingPresetPlugin ↔ client (Lua UI foundation)
+
+**Goal:** (1) **Server → clients:** notify “preset/on-demand vote open — please vote” (payload: enough for UI; e.g. preset name, seconds left, vote kind). (2) **Client → server:** “I vote yes / no” (or timer option later) **without** the client sending session/car id for attribution — **handler uses `ACTcpClient` from the connection** (`ChatCommandContext.Client` pattern); packet body is only vote payload; spoofing another player’s id is therefore not applicable if we never accept id from Lua.
+
+**Docs / patterns (read before coding):**
+- **`docs/technical-docs/client-server-communication.md`:** OnlineEvent **hash** must match; **Lua** passes **`ac.SharedNamespace.ServerScript`** as the **third** argument to **`ac.OnlineEvent(...)`** — *Solution 1 (PenaltyReporterNoClip):* explicit ServerScript namespace so **client-installed** Lua hashes like **server-provided** script behavior; **field order** matches AssettoServer (primitives first, then strings); enable `DebugClientMessages` when hashing.
+- **Client → server reference:** `mods/client-plugins/PenaltyReporterNoClip` (Lua → server handler).
+- **Server → client reference:** `VotingPresetPlugin` already sends **`ReconnectClientPacket`** (`[OnlineEvent]` in `Preset/ReconnectClientPacket.cs`) via `BroadcastPacket`; mirror that pattern for a new outbound type (broadcast or targeted if API allows).
+- **Server custom outbound elsewhere:** e.g. `CollisionPenaltiesPlugin/Packets/ThrottlePenaltyPacket.cs` (server → client); same OnlineEvent registration/send patterns as other plugins.
+
+**Quick implementation talklist:**
+- [ ] Define **C#** `OnlineEvent` types (minimal fields): e.g. `VotingPresetVoteOpenPacket` (server→client), `VotingPresetVoteCastPacket` (client→server: `bool isYes` or `byte choice`).
+- [ ] Register **incoming** handler in plugin (same mechanism as CollisionPenalties / CSP client message dispatch — follow existing `OnlineEvent` consumer in codebase).
+- [ ] On on-demand **start** / updates / end (and optionally timer vote start): `BroadcastPacket` or per-car send the open/status packet **in addition to** existing chat (chat stays fallback until UI is universal).
+- [ ] **Lua** (new or extended app): register receiver with **matching** layout + `ac.SharedNamespace.ServerScript`; on keybind send cast packet with **no** identity field.
+- [ ] Wire handler to **existing** `VoteOnDemand` / `CountVote` logic (same rules as `/yes` `/no` — one code path, chat and packet are two inputs).
+- [ ] Verify hashes in logs; document final structure string in this file or README one-liner when stable.
+
+### 8.1 Minimum participation (e.g. ≥25% of players online)
+
+**What:** Before applying a **winning** on-demand result (and optionally before applying a timer vote winner), require enough **distinct voters**. Example rule: `participated >= ceil(0.25 * total_online)`, with `total_online = _entryCarManager.ConnectedCars.Count` (same population as early-end in §3). If the vote would have passed on yes/no counts but participation is below threshold, treat as **failed**: preset unchanged; decide whether requester gets `RequesterCooldownMinutes` (policy — document in config comment).
+
+**Why:** Stops a single auto-yes (starter) or a tiny clique from changing track on a full server when most people never voted.
+
+**How:** Add config (e.g. `MinParticipationPercent` 0–100, default 0 = current behaviour). At end of `RunOnDemandVoteAsync`: if `yes > no` but `participated < required`, skip `SetPreset`, broadcast reason. Math: `required = max(1, (int)Math.Ceiling(total * percent / 100.0))` unless you explicitly want “0 voters allowed” when percent is 0. For **timer votes**, after `WaitVoting` in `VotingAsync`: if winner has votes but `_alreadyVoted.Count < required`, treat like “stay on track” or “vote failed” (product choice). Edge: AFK cars inflate `total_online` — acceptable if we use the same definition as §3.
+
+### 8.2 Block votes during Race session (Practice / Qualifying only)
+
+**What:** Refuse to **start** timer votes (interval + `/votestart`) and refuse `/preset <number>` on-demand votes while the session is in **Race**. Allow during Practice, Qualifying, and any non-race phase the game exposes (exact enum TBD).
+
+**Why:** Preset changes mid-race are disruptive; practice/qualifying are natural windows.
+
+**How:** Locate in `AssettoServer` the authoritative **session / phase** (naming varies: search for session state, race start, lap counter). Inject that into `VotingPresetPlugin` or read from a small facade. Guard at: `StartOnDemandVote` (reply to requester), `VotingAsync` / `ExecuteAsync` before opening vote, `StartVote` (admin). Return a single clear chat line, e.g. “Preset votes are disabled during the race.” Optional YAML: `DisallowVotesDuringRace: true`. If API only exposes “in race” boolean, map other states to “allowed” by default.
+
+### 8.3 On-demand: remember choice per client; allow changing vote
+
+**What:** Today `_onDemandVoted` is `List<ACTcpClient>` and `VoteOnDemand` rejects a second `/yes` or `/no` with “You voted already.” Replace with **`Dictionary<ACTcpClient, bool>`** (yes=true, no=false) or a tiny enum. On a new vote from the same client, **adjust counts**: decrement previous bucket, increment new bucket, update map entry.
+
+**Why:** Better than a boolean list alone; enables UX “I changed my mind”; optional future: show tallies by name (not required for v1).
+
+**How:** Refactor `VoteOnDemand`; keep early-end logic (`yes_count`, `no_count`, `total`) unchanged except counts must stay consistent when switching. Clear map on vote end/cancel. **Timer vote path** uses `_alreadyVoted` + `_availablePresets[i].Votes` — for change-vote there, use `Dictionary<ACTcpClient, int>` (option index) and on change decrement old option’s votes, increment new; same double-vote guard becomes “update” path.
+
+### 8.4 One formatter for on-demand status text (broadcast vs private)
+
+**What:** Vote **start** uses `BroadcastChat` with `"Change to {Name}? /yes /no ..."`; `GetPresetListAndHelp` (during on-demand) uses `context.Reply` with a similar line but **remaining seconds** and live counts. They are **not** duplicates for different audiences: start is **public**, help is **private** to whoever typed `/preset` with no args — but the **wording drifts** and two places must be edited for i18n or clarity.
+
+**Why:** Single `FormatOnDemandStatus(...)` (or local function) avoids inconsistent messages; optional parameter `forBroadcast: bool` if we ever need a shorter line for chat limits.
+
+**How:** Method parameters e.g. `presetName`, `secondsLeft`, `yes`, `no`, `abstained`. Call from `StartOnDemandVote` (pass `VotingDurationSeconds` as initial `secondsLeft` or compute from `_onDemandEndTime`), `VoteOnDemand`, `RunOnDemandVoteAsync` reminder, and `GetPresetListAndHelp`. Do **not** remove public vs private routing — only unify the **string template**.
