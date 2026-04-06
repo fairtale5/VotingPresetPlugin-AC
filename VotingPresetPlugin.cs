@@ -35,6 +35,7 @@ using AssettoServer.Server.Configuration;
 using AssettoServer.Utils;
 using Microsoft.Extensions.Hosting;
 using Serilog;
+using VotingPresetPlugin.Packets;
 using VotingPresetPlugin.Preset;
 
 namespace VotingPresetPlugin;
@@ -89,6 +90,11 @@ public class VotingPresetPlugin : BackgroundService
     private readonly List<ACTcpClient> _onDemandVoted = new();
     /// <summary>Last time we broadcasted an on-demand vote status line (start message, vote update, or reminder). Used for 30s reminder timing.</summary>
     private DateTime _onDemandLastBroadcastTime;
+    /// <summary>Votable list index for the current on-demand vote (same as /preset &lt;n&gt;). Used for CSP open packet and UI.</summary>
+    private int _onDemandPresetIndex;
+
+    /// <summary>True when extra_cfg allows CSP client messages (packet registration and vote UI broadcast).</summary>
+    private readonly bool _enableClientMessages;
 
     // --- Cooldown: block requester from starting another on-demand vote after a failed one ---
     /// <summary>Maps client to UTC time when their cooldown ends (after they started an on-demand vote that failed). Checked before starting a new on-demand vote.</summary>
@@ -108,6 +114,7 @@ public class VotingPresetPlugin : BackgroundService
     /// 3) Require CSP ≥ 0.2.0 (2651); throw ConfigurationException otherwise.
     /// 4) Apply initial preset: call _presetManager.SetPreset with presetConfigurationManager.CurrentConfiguration.ToPresetType(), IsInit = true, TransitionDuration = 0.
     /// 5) If acServerConfiguration.Extra.EnableClientMessages and _configuration.EnableReconnect: load embedded resource "VotingPresetPlugin.lua.reconnectclient.lua" via Assembly.GetExecutingAssembly().GetManifestResourceStream, then scriptProvider.AddScript(stream, "reconnectclient.lua"); add CSP feature "FREQUENT_TRACK_CHANGES" to cspFeatureManager.
+    /// 6) If EnableClientMessages: register VotingPresetVoteCastPacket so clients can send yes/no via CSP (same rules as chat).
     /// </summary>
     public VotingPresetPlugin(VotingPresetConfiguration configuration,
         PresetConfigurationManager presetConfigurationManager,
@@ -115,11 +122,13 @@ public class VotingPresetPlugin : BackgroundService
         EntryCarManager entryCarManager,
         PresetManager presetManager,
         CSPServerScriptProvider scriptProvider,
-        CSPFeatureManager cspFeatureManager)
+        CSPFeatureManager cspFeatureManager,
+        CSPClientMessageTypeManager cspClientMessageTypeManager)
     {
         _configuration = configuration;
         _entryCarManager = entryCarManager;
         _presetManager = presetManager;
+        _enableClientMessages = acServerConfiguration.Extra.EnableClientMessages;
 
         // Preset lists come from PresetConfigurationManager (loads presets folder / plugin_voting_preset_cfg.yml)
         _votePresets = presetConfigurationManager.VotingPresetTypes;
@@ -143,6 +152,52 @@ public class VotingPresetPlugin : BackgroundService
             scriptProvider.AddScript(Assembly.GetExecutingAssembly().GetManifestResourceStream("VotingPresetPlugin.lua.reconnectclient.lua")!, "reconnectclient.lua");
             cspFeatureManager.Add(new CSPFeature { Name = "FREQUENT_TRACK_CHANGES" });
         }
+
+        // Client → server: preset vote cast (v1 on-demand yes/no). Chat commands still work if Lua is not installed.
+        if (_enableClientMessages)
+            cspClientMessageTypeManager.RegisterOnlineEvent<VotingPresetVoteCastPacket>(OnVoteCastFromClient);
+    }
+
+    /// <summary>
+    /// CSP client sent VotingPreset_VoteCast. Route on-demand yes/no into VoteOnDemand (same trust as /yes /no via ACTcpClient).
+    /// </summary>
+    private void OnVoteCastFromClient(ACTcpClient client, VotingPresetVoteCastPacket packet)
+    {
+        if (packet.VoteKind != VotingPresetVoteCastPacket.VoteKindOnDemandYesNo)
+            return;
+
+        var context = new ChatCommandContext(client, _entryCarManager);
+        VoteOnDemand(context, packet.IsYes);
+    }
+
+    /// <summary>
+    /// Push VotingPreset_VoteOpen to all clients when client messages are on (mirrors on-demand chat tallies for Lua UI).
+    /// </summary>
+    private void BroadcastOnDemandVoteOpenUi(int secondsRemaining)
+    {
+        if (!_enableClientMessages || _onDemandTargetPreset == null)
+            return;
+
+        var abstained = _entryCarManager.ConnectedCars.Count - _onDemandVoted.Count;
+        var name = _onDemandTargetPreset.Name ?? "";
+        if (name.Length > 128)
+            TruncatePresetName(ref name);
+
+        _entryCarManager.BroadcastPacket(new VotingPresetVoteOpenPacket
+        {
+            VoteKind = VotingPresetVoteOpenPacket.VoteKindOnDemandYesNo,
+            SecondsRemaining = (ushort)Math.Clamp(secondsRemaining, 0, ushort.MaxValue),
+            YesCount = (ushort)Math.Clamp(_onDemandYesCount, 0, ushort.MaxValue),
+            NoCount = (ushort)Math.Clamp(_onDemandNoCount, 0, ushort.MaxValue),
+            AbstainedCount = (ushort)Math.Clamp(abstained, 0, ushort.MaxValue),
+            VotableIndex = (byte)Math.Clamp(_onDemandPresetIndex, 0, byte.MaxValue),
+            PresetName = name,
+        });
+    }
+
+    private static void TruncatePresetName(ref string name)
+    {
+        name = name[..128];
     }
 
     /// <summary>
@@ -261,6 +316,7 @@ public class VotingPresetPlugin : BackgroundService
         _voteState = VoteState.OnDemandVote;
         _onDemandRequester = context.Client;
         _onDemandTargetPreset = target;
+        _onDemandPresetIndex = presetIndex;
         _onDemandEndTime = DateTime.UtcNow.AddSeconds(_configuration.VotingDurationSeconds);
         _onDemandVoted.Clear();
         _onDemandVoted.Add(context.Client);
@@ -270,6 +326,7 @@ public class VotingPresetPlugin : BackgroundService
         var abstained = _entryCarManager.ConnectedCars.Count - 1;
         _onDemandLastBroadcastTime = DateTime.UtcNow;
         _entryCarManager.BroadcastChat($"Change to {target.Name}? /yes /no ({_configuration.VotingDurationSeconds}s) — Yes: 1, No: 0, —: {abstained}");
+        BroadcastOnDemandVoteOpenUi(_configuration.VotingDurationSeconds);
         _ = RunOnDemandVoteAsync();
     }
 
@@ -304,6 +361,7 @@ public class VotingPresetPlugin : BackgroundService
                     var s = Math.Max(0, (int)(_onDemandEndTime - DateTime.UtcNow).TotalSeconds);
                     var abstained = total - _onDemandVoted.Count;
                     _entryCarManager.BroadcastChat($"{_onDemandTargetPreset.Name} vote: {s}s left — Yes: {_onDemandYesCount}, No: {_onDemandNoCount}, —: {abstained}");
+                    BroadcastOnDemandVoteOpenUi(s);
                 }
             }
         }
@@ -318,6 +376,7 @@ public class VotingPresetPlugin : BackgroundService
         _voteState = VoteState.Idle;
         _onDemandRequester = null;
         _onDemandTargetPreset = null;
+        _onDemandPresetIndex = 0;
         _onDemandVoted.Clear();
 
         if (target == null || last.Type == null) return;
@@ -369,6 +428,7 @@ public class VotingPresetPlugin : BackgroundService
             var s = Math.Max(0, (int)(_onDemandEndTime - DateTime.UtcNow).TotalSeconds);
             var abstained = _entryCarManager.ConnectedCars.Count - _onDemandVoted.Count;
             _entryCarManager.BroadcastChat($"{_onDemandTargetPreset.Name} vote: {s}s left — Yes: {_onDemandYesCount}, No: {_onDemandNoCount}, —: {abstained}");
+            BroadcastOnDemandVoteOpenUi(s);
         }
     }
 
@@ -386,6 +446,7 @@ public class VotingPresetPlugin : BackgroundService
         _voteState = VoteState.Idle;
         _onDemandRequester = null;
         _onDemandTargetPreset = null;
+        _onDemandPresetIndex = 0;
         _onDemandVoted.Clear();
         if (requester != null)
             _requesterCooldownUntil[requester] = DateTime.UtcNow.AddMinutes(_configuration.RequesterCooldownMinutes);

@@ -79,7 +79,7 @@ One document: plan (command simplification, 30s reminder, early end) and impleme
 
 ### Backlog (not in §5 above)
 
-- [ ] **§8 — First:** Lua vote UI foundation — two-way CSP **OnlineEvent** channel (see **§8, First**). Then §8.1–8.4 as needed.
+- [ ] **§8 — First:** C# **done** for v1 on-demand (packets + `VotingPresetPlugin`: `RegisterOnlineEvent` → `VoteOnDemand`, `BroadcastOnDemandVoteOpenUi` on vote start / each vote update / 30s reminder). **Next:** **Lua** client (matching layout + `SharedNamespace.ServerScript`) + hash verify + optional structure one-liner. Timer CSP = **Soon**. Then §8.1–8.4 as needed.
 
 ---
 
@@ -106,8 +106,20 @@ Backlog for behaviour **not** covered by §5. Same shape as §2–§3: **What**,
 
 **Implement §8 “First” before 8.1–8.4** unless priorities change (packet channel is prerequisite for Lua UI + keybinds).
 
-**Overlap check (nothing below duplicates §2–§3 or §5):**  
+**Overlap check (nothing below duplicates §2–§3 or §5):**
 §2–§3 and the checklist already cover 30s-since-broadcast reminders, broadcast on `/yes`/`/no`, early end, and `/vote` timer text. **§8 First** adds CSP **bidirectional** messages (not chat). **8.1–8.4** add: minimum turnout, session gating, change-vote, shared chat formatter (§7 “shortcuts” is intentionally vague; §8 First is the actionable slice).
+
+### §8 First — Agreed layout (packets & scope)
+
+**Decisions (do not lose track):**
+
+- **`Packets/` folder:** `VotingPresetVoteOpenPacket.cs` (server→client), `VotingPresetVoteCastPacket.cs` (client→server). Keys: **`VotingPreset_VoteOpen`**, **`VotingPreset_VoteCast`** (must match Lua `ac.StructItem.key` exactly).
+- **V1 wire scope:** **On-demand yes/no only** — first fields + handler branch call **`VoteOnDemand`** (same as `/yes` `/no`). **`VoteKind` = 0** = on-demand for v1.
+- **Timer / multi-option:** **Separate phase.** Skeleton = **comments only** inside those two files under a **“Soon”** banner; **no timer fields or handler branches** until we add checklist rows here and implement deliberately. Full behaviour described in comment blocks + this section; avoid mixing into v1 code paths.
+- **Authority for hashing:** **`docs/technical-docs/client-server-communication.md`** — we **do not** duplicate it; plugin **README** links it.
+- **No `dotnet build` / compile checks** unless the person doing the work explicitly wants them.
+
+**README:** CSP vote UI subsection lists keys, `EnableClientMessages`, link to technical doc + this §8.
 
 ### First: two-way VotingPresetPlugin ↔ client (Lua UI foundation)
 
@@ -120,12 +132,13 @@ Backlog for behaviour **not** covered by §5. Same shape as §2–§3: **What**,
 - **Server custom outbound elsewhere:** e.g. `CollisionPenaltiesPlugin/Packets/ThrottlePenaltyPacket.cs` (server → client); same OnlineEvent registration/send patterns as other plugins.
 
 **Quick implementation talklist:**
-- [ ] Define **C#** `OnlineEvent` types (minimal fields): e.g. `VotingPresetVoteOpenPacket` (server→client), `VotingPresetVoteCastPacket` (client→server: `bool isYes` or `byte choice`).
-- [ ] Register **incoming** handler in plugin (same mechanism as CollisionPenalties / CSP client message dispatch — follow existing `OnlineEvent` consumer in codebase).
-- [ ] On on-demand **start** / updates / end (and optionally timer vote start): `BroadcastPacket` or per-car send the open/status packet **in addition to** existing chat (chat stays fallback until UI is universal).
-- [ ] **Lua** (new or extended app): register receiver with **matching** layout + `ac.SharedNamespace.ServerScript`; on keybind send cast packet with **no** identity field.
-- [ ] Wire handler to **existing** `VoteOnDemand` / `CountVote` logic (same rules as `/yes` `/no` — one code path, chat and packet are two inputs).
-- [ ] Verify hashes in logs; document final structure string in this file or README one-liner when stable.
+- [x] **C# v1 packet types:** `Packets/VotingPresetVoteOpenPacket.cs` + `VotingPresetVoteCastPacket.cs` — **`[OnlineEventField]`** payload for on-demand yes/no; **timer/multi-option** = **Soon** comment blocks only (no extra fields).
+- [x] **`VotingPresetPlugin.cs`:** `CSPClientMessageTypeManager` in ctor; if **`EnableClientMessages`**, **`RegisterOnlineEvent<VotingPresetVoteCastPacket>(OnVoteCastFromClient)`** (FastTravel pattern).
+- [x] **`OnVoteCastFromClient`:** `VoteKind` on-demand → **`ChatCommandContext` + `VoteOnDemand`**; timer → **Soon**.
+- [x] On-demand **`BroadcastOnDemandVoteOpenUi`**: on **`StartOnDemandVote`**, after each **`VoteOnDemand`** chat update, and on **30s reminder** (alongside chat). **Timer vote** open packet = **Soon**.
+- [ ] **Lua** (new or extended app): register receiver/send cast with **matching** layout + `ac.SharedNamespace.ServerScript`; keybinds optional.
+- [ ] Verify hashes in logs; add final structure one-liner here or README when Lua lands.
+- [ ] **Soon — Timer / multi-option CSP path:** extend open/cast payloads + `VotingAsync` broadcast + handler → `CountVote` (only after v1 on-demand path is stable; see packet file “Soon” blocks).
 
 ### 8.1 Minimum participation (e.g. ≥25% of players online)
 

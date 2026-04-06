@@ -11,6 +11,19 @@ AssettoServer plugin for preset (track/config) voting. Lets the server rotate pr
 
 **Config:** One file per server (e.g. `plugin_voting_preset_cfg.yml` in preset folders and cfg): timer interval, vote duration, requester cooldown, transition delay, etc. Enable the plugin in server config with `VotingPresetPlugin` in `EnablePlugins`.
 
+### CSP / Lua vote UI (server v1 done; Lua app still needed)
+
+Requires **`EnableClientMessages`** in server extra config (same family as `ReconnectClientPacket`).
+
+| Direction | OnlineEvent key | C# type |
+|-----------|-----------------|---------|
+| Server → client | `VotingPreset_VoteOpen` | `Packets/VotingPresetVoteOpenPacket.cs` — broadcast on on-demand vote **start**, each **vote tally** update, and **30s** reminders (`VotingPresetPlugin`). |
+| Client → server | `VotingPreset_VoteCast` | `Packets/VotingPresetVoteCastPacket.cs` — handled by `OnVoteCastFromClient` → **`VoteOnDemand`** (same as `/yes` / `/no`). |
+
+**v1:** on-demand **yes/no** only over CSP; **chat stays fallback** if no Lua. **Timer / multi-option** over CSP = **later** (`docs/TASKS.md` §8 — Soon blocks in packet files).
+
+**Lua (remaining):** mirror field order/names for both events; `ac.SharedNamespace.ServerScript` on `ac.OnlineEvent` for client-installed apps. **Hashes:** `docs/technical-docs/client-server-communication.md`; enable `DebugClientMessages` while testing (PenaltyReporter pattern).
+
 ### Commands (target)
 
 | Command | Who | What it does |
@@ -45,6 +58,13 @@ AssettoServer plugin for preset (track/config) voting. Lets the server rotate pr
 | **VotingPresetConfiguration.cs** | Config model: interval, vote duration, requester cooldown, transition delay, etc. One place to tweak per server. |
 | **VotingPresetConfigurationValidator.cs** | Validates config (e.g. VoteChoices ≥ 2, IntervalMinutes ≥ 5, RequesterCooldownMinutes ≥ 0). |
 
+**Packets/** — CSP OnlineEvent types (vote UI channel; see README subsection above)
+
+| File | Responsibility |
+|------|----------------|
+| **VotingPresetVoteOpenPacket.cs** | Server → client: vote open / UI prompt (v1 on-demand; timer = Soon, comments only). |
+| **VotingPresetVoteCastPacket.cs** | Client → server: cast vote (v1 yes/no; timer option = Soon, comments only). |
+
 **Preset/** — preset types and application
 
 | File | Responsibility |
@@ -66,7 +86,7 @@ AssettoServer plugin for preset (track/config) voting. Lets the server rotate pr
 
 | Content | Responsibility |
 |---------|-----------------|
-| **reconnecting.png** | Image shown to clients during preset-change reconnect. Served at `/static/VotingPresetPlugin/reconnecting.png`. |
+| **loading-track.png** | Image shown to clients during preset-change reconnect. Served at `/static/VotingPresetPlugin/loading-track.png`. |
 
 ---
 
@@ -74,7 +94,7 @@ AssettoServer plugin for preset (track/config) voting. Lets the server rotate pr
 
 | File | Purpose |
 |------|---------|
-| **TASKS.md** | Plan and implementation checklist: command simplification, 30s reminder behaviour, early end rules, and open points. Single place for “what to do next.” |
+| **TASKS.md** | Plan and implementation checklist: command simplification, 30s reminder behaviour, early end rules, **§8 CSP vote UI** (packet scope v1 vs timer Soon), and open points. Single place for “what to do next.” |
 | **WHY_CHAT_ONLY_NOT_SHORTCUTS.md** | Explains why we use chat commands (/yes, /no) instead of in-game keyboard shortcuts: we couldn’t capture shortcut traffic in tests; may be revisited later. |
 
 
