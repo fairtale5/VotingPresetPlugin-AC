@@ -158,11 +158,13 @@ Backlog for behaviour **not** covered by §5. Same shape as §2–§3: **What**,
 
 ### 8.3 On-demand: remember choice per client; allow changing vote
 
-**What:** Today `_onDemandVoted` is `List<ACTcpClient>` and `VoteOnDemand` rejects a second `/yes` or `/no` with “You voted already.” Replace with **`Dictionary<ACTcpClient, bool>`** (yes=true, no=false) or a tiny enum. On a new vote from the same client, **adjust counts**: decrement previous bucket, increment new bucket, update map entry.
+- [x] **Data structure:** `_onDemandVoteByClient` is **`Dictionary<ACTcpClient, bool>`** (yes=true, no=false). Key present iff that client has voted this round; abstain count still `ConnectedCars.Count - dictionary.Count`. Cleared when the on-demand vote ends or is canceled. `StartOnDemandVote` seeds the requester as **yes** via `[context.Client] = true`.
 
-**Why:** Better than a boolean list alone; enables UX “I changed my mind”; optional future: show tallies by name (not required for v1).
+- [x] **Behaviour — change vote:** `VoteOnDemand` uses `TryGetValue`: first vote increments counts; flip yes→no or no→yes decrements old side and increments new; same choice again replies “Your vote is unchanged.” and skips broadcast. Early-end logic still reads `_onDemandYesCount` / `_onDemandNoCount` only.
 
-**How:** Refactor `VoteOnDemand`; keep early-end logic (`yes_count`, `no_count`, `total`) unchanged except counts must stay consistent when switching. Clear map on vote end/cancel. **Timer vote path** uses `_alreadyVoted` + `_availablePresets[i].Votes` — for change-vote there, use `Dictionary<ACTcpClient, int>` (option index) and on change decrement old option’s votes, increment new; same double-vote guard becomes “update” path.
+**Why:** Storing yes/no per client is required before users can change their ballot without corrupting tallies.
+
+**Timer vote path** (later): `_alreadyVoted` + `_availablePresets[i].Votes` — for change-vote there, use `Dictionary<ACTcpClient, int>` (option index) and on change decrement old option’s votes, increment new.
 
 ### 8.4 One formatter for on-demand status text (broadcast vs private)
 

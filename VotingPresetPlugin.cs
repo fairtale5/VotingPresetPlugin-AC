@@ -25,7 +25,7 @@
 /// 5. Result: VotingAsync takes the option(s) with the highest vote count in _availablePresets,
 ///    picks a random winner if tie, then either broadcasts "staying on track" or calls
 ///    _presetManager.SetPreset with PresetData(current, winner) after TransitionDelayMilliseconds.
-/// 6. State: _voteState (Idle | TimerVote | OnDemandVote) ensures only one vote at a time; _alreadyVoted prevents double-vote per client. _finishVote and _extendVotingSeconds are the only way admin can end or extend the wait inside WaitVoting. On-demand: StartOnDemandVote (from /preset &lt;number&gt;) sets OnDemandVote, RunOnDemandVoteAsync runs the timer and reminders; /yes and /no call VoteOnDemand. Cooldown applied to requester when on-demand vote fails or is canceled.
+/// 6. State: _voteState (Idle | TimerVote | OnDemandVote) ensures only one vote at a time; _alreadyVoted prevents double-vote per client in timer votes. _finishVote and _extendVotingSeconds are the only way admin can end or extend the wait inside WaitVoting. On-demand: _onDemandVoteByClient maps each voter (ACTcpClient) to yes=true or no=false; StartOnDemandVote sets OnDemandVote, RunOnDemandVoteAsync runs reminders; /yes and /no call VoteOnDemand (users may switch yes/no; tallies adjust). Cooldown applied to requester when on-demand vote fails or is canceled.
 /// </summary>
 using System.Reflection;
 using AssettoServer.Commands.Contexts;
@@ -86,8 +86,8 @@ public class VotingPresetPlugin : BackgroundService
     private int _onDemandYesCount;
     /// <summary>Number of no votes in the current on-demand vote.</summary>
     private int _onDemandNoCount;
-    /// <summary>Clients who have already voted in the current on-demand vote (one vote per client).</summary>
-    private readonly List<ACTcpClient> _onDemandVoted = new();
+    /// <summary>On-demand ballot: client → true=yes, false=no. Key present iff that client has cast a vote this round.</summary>
+    private readonly Dictionary<ACTcpClient, bool> _onDemandVoteByClient = new();
     /// <summary>Last time we broadcasted an on-demand vote status line (start message, vote update, or reminder). Used for 30s reminder timing.</summary>
     private DateTime _onDemandLastBroadcastTime;
     /// <summary>Votable list index for the current on-demand vote (same as /preset &lt;n&gt;). Used for CSP open packet and UI.</summary>
@@ -178,7 +178,7 @@ public class VotingPresetPlugin : BackgroundService
         if (!_enableClientMessages || _onDemandTargetPreset == null)
             return;
 
-        var abstained = _entryCarManager.ConnectedCars.Count - _onDemandVoted.Count;
+        var abstained = _entryCarManager.ConnectedCars.Count - _onDemandVoteByClient.Count;
         var name = _onDemandTargetPreset.Name ?? "";
         if (name.Length > 128)
             TruncatePresetName(ref name);
@@ -270,7 +270,7 @@ public class VotingPresetPlugin : BackgroundService
         {
             var remaining = (_onDemandEndTime - DateTime.UtcNow).TotalSeconds;
             var s = Math.Max(0, (int)remaining);
-            var abstained = _entryCarManager.ConnectedCars.Count - _onDemandVoted.Count;
+            var abstained = _entryCarManager.ConnectedCars.Count - _onDemandVoteByClient.Count;
             context.Reply($"Vote in progress for {_onDemandTargetPreset.Name}. {s}s left. /yes /no — Yes: {_onDemandYesCount}, No: {_onDemandNoCount}, —: {abstained}");
         }
         else if (_voteState == VoteState.TimerVote)
@@ -318,8 +318,8 @@ public class VotingPresetPlugin : BackgroundService
         _onDemandTargetPreset = target;
         _onDemandPresetIndex = presetIndex;
         _onDemandEndTime = DateTime.UtcNow.AddSeconds(_configuration.VotingDurationSeconds);
-        _onDemandVoted.Clear();
-        _onDemandVoted.Add(context.Client);
+        _onDemandVoteByClient.Clear();
+        _onDemandVoteByClient[context.Client] = true;
         _onDemandYesCount = 1;
         _onDemandNoCount = 0;
 
@@ -359,7 +359,7 @@ public class VotingPresetPlugin : BackgroundService
                 {
                     _onDemandLastBroadcastTime = DateTime.UtcNow;
                     var s = Math.Max(0, (int)(_onDemandEndTime - DateTime.UtcNow).TotalSeconds);
-                    var abstained = total - _onDemandVoted.Count;
+                    var abstained = total - _onDemandVoteByClient.Count;
                     _entryCarManager.BroadcastChat($"{_onDemandTargetPreset.Name} vote: {s}s left — Yes: {_onDemandYesCount}, No: {_onDemandNoCount}, —: {abstained}");
                     BroadcastOnDemandVoteOpenUi(s);
                 }
@@ -377,7 +377,7 @@ public class VotingPresetPlugin : BackgroundService
         _onDemandRequester = null;
         _onDemandTargetPreset = null;
         _onDemandPresetIndex = 0;
-        _onDemandVoted.Clear();
+        _onDemandVoteByClient.Clear();
 
         if (target == null || last.Type == null) return;
 
@@ -401,8 +401,8 @@ public class VotingPresetPlugin : BackgroundService
     }
 
     /// <summary>
-    /// Record one player's yes or no during an on-demand vote. Reject if not OnDemandVote or already voted; else add to _onDemandVoted and increment _onDemandYesCount or _onDemandNoCount.
-    /// Also broadcast updated counts to all players and reset the 30s reminder timer.
+    /// Record one player's yes or no during an on-demand vote. New voters add to tallies; returning voters overwrite their map entry and move one count from the old side to the new when the choice differs.
+    /// Broadcasts only after a tally change (not when the same choice is sent again).
     /// </summary>
     internal void VoteOnDemand(ChatCommandContext context, bool isYes)
     {
@@ -411,22 +411,40 @@ public class VotingPresetPlugin : BackgroundService
             context.Reply("There is no ongoing preset vote.");
             return;
         }
-        if (_onDemandVoted.Contains(context.Client))
+
+        if (!_onDemandVoteByClient.TryGetValue(context.Client, out var previous))
         {
-            context.Reply("You voted already.");
+            _onDemandVoteByClient[context.Client] = isYes;
+            if (isYes)
+                _onDemandYesCount++;
+            else
+                _onDemandNoCount++;
+            context.Reply("Your vote has been counted.");
+        }
+        else if (previous == isYes)
+        {
+            context.Reply("Your vote is unchanged.");
             return;
         }
-        _onDemandVoted.Add(context.Client);
-        if (isYes)
-            _onDemandYesCount++;
         else
-            _onDemandNoCount++;
-        context.Reply("Your vote has been counted.");
+        {
+            _onDemandVoteByClient[context.Client] = isYes;
+            if (previous)
+                _onDemandYesCount--;
+            else
+                _onDemandNoCount--;
+            if (isYes)
+                _onDemandYesCount++;
+            else
+                _onDemandNoCount++;
+            context.Reply("Your vote has been updated.");
+        }
+
         if (_onDemandTargetPreset != null)
         {
             _onDemandLastBroadcastTime = DateTime.UtcNow;
             var s = Math.Max(0, (int)(_onDemandEndTime - DateTime.UtcNow).TotalSeconds);
-            var abstained = _entryCarManager.ConnectedCars.Count - _onDemandVoted.Count;
+            var abstained = _entryCarManager.ConnectedCars.Count - _onDemandVoteByClient.Count;
             _entryCarManager.BroadcastChat($"{_onDemandTargetPreset.Name} vote: {s}s left — Yes: {_onDemandYesCount}, No: {_onDemandNoCount}, —: {abstained}");
             BroadcastOnDemandVoteOpenUi(s);
         }
@@ -447,7 +465,7 @@ public class VotingPresetPlugin : BackgroundService
         _onDemandRequester = null;
         _onDemandTargetPreset = null;
         _onDemandPresetIndex = 0;
-        _onDemandVoted.Clear();
+        _onDemandVoteByClient.Clear();
         if (requester != null)
             _requesterCooldownUntil[requester] = DateTime.UtcNow.AddMinutes(_configuration.RequesterCooldownMinutes);
         _entryCarManager.BroadcastChat("On-demand vote canceled by admin.");
