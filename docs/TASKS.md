@@ -107,7 +107,7 @@ Backlog for behaviour **not** covered by §5. Same shape as §2–§3: **What**,
 **Implement §8 “First” before 8.1–8.4** unless priorities change (packet channel is prerequisite for Lua UI + keybinds).
 
 **Overlap check (nothing below duplicates §2–§3 or §5):**
-§2–§3 and the checklist already cover 30s-since-broadcast reminders, broadcast on `/yes`/`/no`, early end, and `/vote` timer text. **§8 First** adds CSP **bidirectional** messages (not chat). **8.1–8.4** add: minimum turnout, session gating, change-vote, shared chat formatter (§7 “shortcuts” is intentionally vague; §8 First is the actionable slice).
+§2–§3 and the checklist already cover 30s-since-broadcast reminders, broadcast on `/yes`/`/no`, early end, and `/vote` timer text. **§8 First** adds CSP **bidirectional** messages (not chat). **8.1–8.4** add: minimum turnout, **session-safe voting and deferred timer (8.2 — spec + checklist)**, change-vote, shared chat formatter (§7 “shortcuts” is intentionally vague; §8 First is the actionable slice).
 
 ### §8 First — Agreed layout (packets & scope)
 
@@ -148,13 +148,81 @@ Backlog for behaviour **not** covered by §5. Same shape as §2–§3: **What**,
 
 **How:** Add config (e.g. `MinParticipationPercent` 0–100, default 0 = current behaviour). At end of `RunOnDemandVoteAsync`: if `yes > no` but `participated < required`, skip `SetPreset`, broadcast reason. Math: `required = max(1, (int)Math.Ceiling(total * percent / 100.0))` unless you explicitly want “0 voters allowed” when percent is 0. For **timer votes**, after `WaitVoting` in `VotingAsync`: if winner has votes but `_alreadyVoted.Count < required`, treat like “stay on track” or “vote failed” (product choice). Edge: AFK cars inflate `total_online` — acceptable if we use the same definition as §3.
 
-### 8.2 Block votes during Race session (Practice / Qualifying only)
+### 8.2 Session-safe voting and preset changes (no mid-race; defer timer; apply in P/Q window)
 
-**What:** Refuse to **start** timer votes (interval + `/votestart`) and refuse `/preset <number>` on-demand votes while the session is in **Race**. Allow during Practice, Qualifying, and any non-race phase the game exposes (exact enum TBD).
+**Product intent (FastFox):**
 
-**Why:** Preset changes mid-race are disruptive; practice/qualifying are natural windows.
+1. **Do not start votes during Race** — timer vote and on-demand (`/preset <n>`) may run only in **Practice** and **Qualifying** (see Booking below).
+2. **Timer-driven behaviour** — when the interval elapses during Race, **do not** open a vote or call `SetPreset` immediately. **Defer** until a safe window (see 3).
+3. **When a deferred change is applied** — apply only during **early Practice or early Qualifying**, not in the **tail of Qualifying** (the “session ending / about to go to Race” period). **Do not** switch preset at the moment Qualifying ends if that would interrupt the transition into Race.
 
-**How:** Locate in `AssettoServer` the authoritative **session / phase** (naming varies: search for session state, race start, lap counter). Inject that into `VotingPresetPlugin` or read from a small facade. Guard at: `StartOnDemandVote` (reply to requester), `VotingAsync` / `ExecuteAsync` before opening vote, `StartVote` (admin). Return a single clear chat line, e.g. “Preset votes are disabled during the race.” Optional YAML: `DisallowVotesDuringRace: true`. If API only exposes “in race” boolean, map other states to “allowed” by default.
+**Why:** Reconnect / restart during Race or right before the race start breaks the event flow; P/Q are natural windows.
+
+**Investigation summary (no code changes yet):**
+
+- **VotingPresetPlugin** has **no** `SessionManager` (or session type) dependency today. All paths are time/state only:
+  - **`ExecuteAsync`** waits `IntervalMilliseconds - VotingDurationMilliseconds`, then calls **`VotingAsync`** if `EnableVote` — **no session check**.
+  - **`VotingAsync`** can **`SetPreset`** after a vote, on **“only one other preset”** auto-switch, or after `WaitVoting`; **`StartOnDemandVote`**, **`StartVote`**, **`RunOnDemandVoteAsync`** likewise **never** read session phase.
+- **Authoritative session type** in this tree: `AssettoServer.Server.SessionManager.CurrentSession` → `SessionState.Configuration.Type` → `AssettoServer.Shared.Model.SessionType` (`Booking`, `Practice`, `Qualifying`, `Race`). Session lifecycle and transitions live in **`SessionManager.cs`** (`NextSession`, `IsSessionOver`, etc.). **`SessionChanged`** (`EventArgs.cs` → `SessionChangedEventArgs` with `PreviousSession`, `NextSession`) fires when a new session starts — good hook for “session just started”.
+- **`PresetManager`** only reacts to **`SetPreset`** (restart/reconnect path); it does not know about sessions. Any gating belongs in **VotingPresetPlugin** (and optionally a tiny helper), not in `PresetManager`.
+
+**Booking:** Decide explicitly: allow or deny votes during **Booking** (enum exists; many servers skip or shorten it). Default suggestion: **same as Race** (deny) unless config says otherwise.
+
+**Admin commands:** **`/presetset`**, **`/presetrandom`**, **`/votestart`** are instant / admin-driven. Product default: **only gate player-facing starts** (`ExecuteAsync` interval, **`StartOnDemandVote`**); document whether admins may still force a switch during Race (recommend: leave admin path unrestricted unless you add `AdminRespectsSessionGate`).
+
+---
+
+#### 8.2a — Refuse to *start* votes in Race (and optionally Booking)
+
+**Where to guard (same message to players):**
+
+| Entry point | Method | Behaviour when disallowed |
+|-------------|--------|---------------------------|
+| Interval timer | `ExecuteAsync` → do not call `VotingAsync` yet; mark deferred (8.2b) | No chat spam each tick; optional one-line log |
+| Admin timer start | `StartVote` | Reply: preset vote cannot start during race |
+| On-demand | `StartOnDemandVote` | Reply to requester only |
+
+**Config:** e.g. `DisallowVotesDuringRace: true` (default `true` when feature ships) + optional `DisallowVotesDuringBooking`.
+
+---
+
+#### 8.2b — Defer interval when it fires in Race (or when not in P/Q)
+
+**Today:** The loop always waits the same delta, then runs `VotingAsync` if `EnableVote`.
+
+**Target flow:**
+
+1. When the wait completes, read **current** session type from **`SessionManager`**.
+2. If type is **Race** (or Booking if configured): **do not** call `VotingAsync`. Set an internal flag, e.g. **`_timerVotePendingAfterRace`** (or a small struct: pending + reason), and **return to the wait** — or wait a short poll until session changes (avoid busy-loop; align with `SessionChanged` or a few seconds’ delay).
+3. When session becomes **Practice** or **Qualifying**, if a vote is pending, run **`VotingAsync`** once (subject to 8.2c window), then clear the flag. If multiple interval ticks passed during one long Race, **collapse** to one pending vote (product: one vote per “safe window”, not a backlog storm).
+
+**Edge:** **`VotingAsync` “only one other preset”** branch also calls **`SetPreset`** without a vote — that path must use the **same** deferral / apply rules as a full vote.
+
+---
+
+#### 8.2c — Apply only in “early” P/Q; not at end of Qualifying
+
+**Problem:** Entering Qualifying is safe at **session start**; the **end** of Qualifying (time nearly up, `SessionOverFlag`-adjacent behaviour) is **not** — user asked not to change “at the END of qualifying”.
+
+**Approach (pick one and document in config comments):**
+
+- **A — Session-changed hook:** Subscribe to **`SessionManager.SessionChanged`**. When **`NextSession.Configuration.Type`** is **Practice** or **Qualifying**, treat the first part of the session as the apply window (e.g. first **N** seconds after change, using `NextSession.SessionTimeMilliseconds` / server time vs `StartTimeMilliseconds`). If a deferred vote completed earlier but apply was held, apply here. Optionally **refuse to start** a new timer vote if `TimeLeftMilliseconds` is below a threshold (so you never *start* voting in the last minute of Quali).
+- **B — Time-left guard:** Allow `SetPreset` only when `SessionType` is P/Q **and** `TimeLeftMilliseconds > EndOfSessionGuardMs` (config), so the tail of Qualifying is excluded.
+- **C — Combined:** Session-changed for “fresh session” + time-left guard for long sessions.
+
+**Explicit rule:** When transitioning **Qualifying → Race**, do **not** apply a pending preset change as part of “quali just ended”; hold until **next** Practice or Qualifying **start** (e.g. next event cycle), unless product decides otherwise.
+
+---
+
+#### 8.2 — Implementation checklist
+
+- [ ] Register **`SessionManager`** in **`VotingPresetModule`** / ctor of **`VotingPresetPlugin`** (same DI pattern as other plugins using session, e.g. **`CollisionPenaltiesFeature`**, **`RaceStartGraceFeature`**).
+- [ ] Add config keys + validator comments: `DisallowVotesDuringRace`, optional `DisallowVotesDuringBooking`, `DeferTimerVoteUntilPracticeOrQualifying`, `QualifyingEndGuardSeconds` (or equivalent for approach A/B/C).
+- [ ] **`StartOnDemandVote`**: session gate + user message.
+- [ ] **`StartVote`**: session gate + admin message.
+- [ ] **`ExecuteAsync`**: defer flag instead of blind `VotingAsync`; integrate with **`SessionChanged`** or periodic check.
+- [ ] **`VotingAsync`**: all **`SetPreset`** exits (winner, stay, single-preset auto) respect apply-window rules; no apply in Race tail / disallowed transitions.
+- [ ] Manual test matrix: interval fires in Practice / Qualifying / Race; long Race; vote win during Quali last 30s; only-one-preset auto during Race; on-demand during Race (denied).
 
 ### 8.3 On-demand: remember choice per client; allow changing vote
 

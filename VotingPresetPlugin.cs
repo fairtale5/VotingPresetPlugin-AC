@@ -7,13 +7,12 @@
 /// Admins can list presets, set preset directly, start/finish/cancel/extend the timer vote.
 ///
 /// How it works:
-/// 1. Preset lists: PresetConfigurationManager (injected) provides VotingPresetTypes (_votePresets)
-///    and AllPresetTypes (_adminPresets). Those are loaded from the presets folder and
-///    plugin_voting_preset_cfg.yml by the manager; this plugin only reads them.
+/// 1. Preset lists: PresetConfigurationManager provides votable and all presets; this plugin partitions
+///    public vs admin-only, sorts each group by display name, and builds one contiguous index list.
 /// 2. Timer loop: ExecuteAsync waits (IntervalMilliseconds − VotingDurationMilliseconds), then
 ///    calls VotingAsync(stoppingToken) if EnableVote is true. So the vote window is the last
 ///    VotingDurationSeconds of each interval.
-/// 3. Starting a vote: VotingAsync builds _availablePresets from _votePresets (current preset
+/// 3. Starting a vote: VotingAsync builds _availablePresets from _publicPresetsOrdered (current preset
 ///    removed; optionally "stay on track" as option 0; then random others up to VoteChoices).
 ///    It broadcasts "Vote for next track:" and "/vt i - Name" for each option via
 ///    _entryCarManager.BroadcastChat. Then it calls WaitVoting to hold the vote open.
@@ -27,6 +26,7 @@
 ///    _presetManager.SetPreset with PresetData(current, winner) after TransitionDelayMilliseconds.
 /// 6. State: _voteState (Idle | TimerVote | OnDemandVote) ensures only one vote at a time; _alreadyVoted prevents double-vote per client in timer votes. _finishVote and _extendVotingSeconds are the only way admin can end or extend the wait inside WaitVoting. On-demand: _onDemandVoteByClient maps each voter (ACTcpClient) to yes=true or no=false; StartOnDemandVote sets OnDemandVote, RunOnDemandVoteAsync runs reminders; /yes and /no call VoteOnDemand (users may switch yes/no; tallies adjust). Cooldown applied to requester when on-demand vote fails or is canceled.
 /// </summary>
+using System.Linq;
 using System.Reflection;
 using AssettoServer.Commands.Contexts;
 using AssettoServer.Network.Tcp;
@@ -54,8 +54,8 @@ public class VotingPresetPlugin : BackgroundService
     private readonly PresetManager _presetManager;
     private readonly VotingPresetConfiguration _configuration;
 
-    /// <summary>Presets that may appear in a timer vote (from PresetConfigurationManager.VotingPresetTypes).</summary>
-    private readonly List<PresetType> _votePresets;
+    /// <summary>Public (votable) presets only, sorted by <see cref="PresetType.Name"/> so /preset indices stay 0..N-1 with no gaps.</summary>
+    private readonly List<PresetType> _publicPresetsOrdered;
     /// <summary>Clients who have already cast a vote in the current timer vote (used to block double-vote).</summary>
     private readonly List<ACTcpClient> _alreadyVoted = new();
     /// <summary>Current vote options: each PresetChoice holds a PresetType and its vote count; built at vote start and updated by CountVote.</summary>
@@ -65,6 +65,12 @@ public class VotingPresetPlugin : BackgroundService
 
     /// <summary>All presets (votable + admin-only) from PresetConfigurationManager.AllPresetTypes; used for /presetlist and admin SetPreset/RandomPreset by index.</summary>
     private readonly List<PresetType> _adminPresets;
+
+    /// <summary>Public presets first (alphabetically by name), then admin-only presets (alphabetically by name). Same list drives /presets, /preset, and /presetset.</summary>
+    private readonly List<PresetType> _unifiedPresets;
+
+    /// <summary>Count of public (non–admin-only) presets at the start of _unifiedPresets. /preset &lt;n&gt; only allows n &lt; this.</summary>
+    private readonly int _publicPresetCount;
 
     /// <summary>Current vote state. Idle = no vote; TimerVote = timer vote in progress (VotingAsync + WaitVoting); OnDemandVote = on-demand yes/no vote in progress (StartOnDemandVote + RunOnDemandVoteAsync).</summary>
     private VoteState _voteState = VoteState.Idle;
@@ -110,7 +116,7 @@ public class VotingPresetPlugin : BackgroundService
     /// <summary>
     /// Constructor – wires config and preset lists, applies initial preset, optionally registers reconnect Lua.
     /// 1) Store configuration, entryCarManager, presetManager.
-    /// 2) Load _votePresets from presetConfigurationManager.VotingPresetTypes and _adminPresets from presetConfigurationManager.AllPresetTypes (manager loads from presets folder and plugin config).
+    /// 2) Build sorted public list, sorted admin-only list, and _unifiedPresets from PresetConfigurationManager.
     /// 3) Require CSP ≥ 0.2.0 (2651); throw ConfigurationException otherwise.
     /// 4) Apply initial preset: call _presetManager.SetPreset with presetConfigurationManager.CurrentConfiguration.ToPresetType(), IsInit = true, TransitionDuration = 0.
     /// 5) If acServerConfiguration.Extra.EnableClientMessages and _configuration.EnableReconnect: load embedded resource "VotingPresetPlugin.lua.reconnectclient.lua" via Assembly.GetExecutingAssembly().GetManifestResourceStream, then scriptProvider.AddScript(stream, "reconnectclient.lua"); add CSP feature "FREQUENT_TRACK_CHANGES" to cspFeatureManager.
@@ -130,9 +136,23 @@ public class VotingPresetPlugin : BackgroundService
         _presetManager = presetManager;
         _enableClientMessages = acServerConfiguration.Extra.EnableClientMessages;
 
-        // Preset lists come from PresetConfigurationManager (loads presets folder / plugin_voting_preset_cfg.yml)
-        _votePresets = presetConfigurationManager.VotingPresetTypes;
+        // Preset lists from PresetConfigurationManager; partition public vs admin-only, sort each by display name, then one contiguous index space.
         _adminPresets = presetConfigurationManager.AllPresetTypes;
+        var voteFromManager = presetConfigurationManager.VotingPresetTypes;
+
+        _publicPresetsOrdered = voteFromManager
+            .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var adminOnlyOrdered = _adminPresets
+            .Where(p => !voteFromManager.Any(v => v.Equals(p)))
+            .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        _unifiedPresets = new List<PresetType>(_publicPresetsOrdered.Count + adminOnlyOrdered.Count);
+        _unifiedPresets.AddRange(_publicPresetsOrdered);
+        _unifiedPresets.AddRange(adminOnlyOrdered);
+        _publicPresetCount = _publicPresetsOrdered.Count;
 
         if (acServerConfiguration.CSPTrackOptions.MinimumCSPVersion < CSPVersion.V0_2_0)
         {
@@ -227,25 +247,23 @@ public class VotingPresetPlugin : BackgroundService
     }
 
     /// <summary>
-    /// Reply with votable presets for /preset: "To start a vote: /preset &lt;number&gt;" then for each i in _votePresets reply " /preset {i} - {Name}" (votable presets only).
-    /// If context.IsAdministrator, also add "Restricted presets use: /presetset &lt;number&gt;" and, for each i where _adminPresets[i] is not in _votePresets, reply " /presetset {i} - {Name}".
-    /// This keeps /preset indices for players and /presetset indices for admins aligned with the underlying preset lists.
+    /// Reply with votable presets using unified indices 0..public-1 for /preset, then (if admin) admin-only presets with /presetset using continuing indices public..total-1.
+    /// /presetset accepts any unified index for an instant switch (same numbering as the two blocks together).
     /// </summary>
     internal void ListAllPresets(BaseCommandContext context)
     {
         context.Reply("To start a vote: /preset <number>");
-        for (int i = 0; i < _votePresets.Count; i++)
-            context.Reply($" /preset {i} - {_votePresets[i].Name}");
+        for (int i = 0; i < _publicPresetCount; i++)
+            context.Reply($" /preset {i} - {_unifiedPresets[i].Name}");
 
         if (!context.IsAdministrator) return;
 
         context.Reply("Restricted presets use: /presetset <number>");
-        for (int i = 0; i < _adminPresets.Count; i++)
-        {
-            var adminPreset = _adminPresets[i];
-            if (_votePresets.Any(v => v.Equals(adminPreset))) continue;
-            context.Reply($" /presetset {i} - {adminPreset.Name}");
-        }
+        for (int i = _publicPresetCount; i < _unifiedPresets.Count; i++)
+            context.Reply($" /presetset {i} - {_unifiedPresets[i].Name}");
+
+        context.Reply(
+            $"Admins: /presetset 0–{_unifiedPresets.Count - 1} switches instantly (same numbers as above; /preset n only starts a vote for public presets).");
     }
 
     /// <summary>
@@ -279,8 +297,8 @@ public class VotingPresetPlugin : BackgroundService
         }
 
         context.Reply("Votable presets:");
-        for (int i = 0; i < _votePresets.Count; i++)
-            context.Reply($" {i} - {_votePresets[i].Name}");
+        for (int i = 0; i < _publicPresetCount; i++)
+            context.Reply($" {i} - {_unifiedPresets[i].Name}");
         context.Reply("Use /preset <number> to start a vote.");
     }
 
@@ -294,9 +312,9 @@ public class VotingPresetPlugin : BackgroundService
             context.Reply("A vote is already in progress.");
             return;
         }
-        if (presetIndex < 0 || presetIndex >= _votePresets.Count)
+        if (presetIndex < 0 || presetIndex >= _publicPresetCount)
         {
-            context.Reply("Invalid preset number. Use /preset to see the list.");
+            context.Reply("Invalid preset number. Use /presets for public presets, or /presetset (admin) for any track.");
             return;
         }
         if (_requesterCooldownUntil.TryGetValue(context.Client, out var until) && until > DateTime.UtcNow)
@@ -306,7 +324,7 @@ public class VotingPresetPlugin : BackgroundService
             return;
         }
 
-        var target = _votePresets[presetIndex];
+        var target = _unifiedPresets[presetIndex];
         if (target.Equals(_presetManager.CurrentPreset.Type))
         {
             context.Reply("Current preset is already this track.");
@@ -485,21 +503,20 @@ public class VotingPresetPlugin : BackgroundService
     }
 
     /// <summary>
-    /// Admin sets preset by index. 1) last = _presetManager.CurrentPreset. 2) If choice &lt; 0 or choice >= _adminPresets.Count, reply "Invalid preset choice." and return. 3) next = _adminPresets[choice]. 4) If last.Type equals next, reply no change. 5) Else reply "Switching to preset: {next.Name}" and call AdminPreset(PresetData(last.Type, next, TransitionDurationSeconds from config)).
+    /// Admin sets preset by unified index (same order as /presets: public first, then admin-only).
     /// </summary>
     internal void SetPreset(BaseCommandContext context, int choice)
     {
         var last = _presetManager.CurrentPreset;
 
-        if (choice < 0 && choice >= _adminPresets.Count)
+        if (choice < 0 || choice >= _unifiedPresets.Count)
         {
             Log.Information("Invalid preset choice");
             context.Reply("Invalid preset choice.");
-
             return;
         }
 
-        var next = _adminPresets[choice];
+        var next = _unifiedPresets[choice];
 
         if (last.Type!.Equals(next))
         {
@@ -517,7 +534,7 @@ public class VotingPresetPlugin : BackgroundService
     }
 
     /// <summary>
-    /// Admin picks a random other preset. 1) last = _presetManager.CurrentPreset. 2) Draw next from _adminPresets at Random.Shared.Next(_adminPresets.Count) until next is not equal to last.Type. 3) Reply "Switching to random preset: {next.Name}" and call AdminPreset(PresetData(current, next, TransitionDurationSeconds)).
+    /// Admin picks a random other preset from the unified list.
     /// </summary>
     internal void RandomPreset(BaseCommandContext context)
     {
@@ -526,7 +543,7 @@ public class VotingPresetPlugin : BackgroundService
         PresetType next;
         do
         {
-            next = _adminPresets[Random.Shared.Next(_adminPresets.Count)];
+            next = _unifiedPresets[Random.Shared.Next(_unifiedPresets.Count)];
         } while (last.Type!.Equals(next));
         context.Reply($"Switching to random preset: {next.Name}");
         _ = AdminPreset(new PresetData(_presetManager.CurrentPreset.Type, next)
@@ -662,7 +679,7 @@ public class VotingPresetPlugin : BackgroundService
 
     /// <summary>
     /// Run one full timer vote: build options, broadcast, wait for votes, pick winner, apply or stay.
-    /// 1) If _voteState != Idle, return immediately. 2) Set _voteState = TimerVote. 3) last = _presetManager.CurrentPreset. 4) Clear _availablePresets and _alreadyVoted. 5) presetsLeft = copy of _votePresets with last.Type removed (so we only offer other presets). If presetsLeft.Count == 0: log "Not enough presets", set Idle, return. If presetsLeft.Count == 1: log and broadcast "only one other preset, changing without a vote", delay and SetPreset, set Idle, return. 6) If EnableVote or manualVote: broadcast "Vote for next track:". 7) If EnableStayOnTrack: add PresetChoice(last.Type, Votes=0) to _availablePresets; if voting enabled broadcast " /vt 0 - Stay on current track.". 8) For i from _availablePresets.Count to VoteChoices-1: if presetsLeft empty break; nextPreset = random from presetsLeft; add PresetChoice(nextPreset, 0) to _availablePresets; remove nextPreset from presetsLeft; if voting enabled broadcast " /vt {i} - {nextPreset.Name}". 9) If EnableVote or manualVote: await WaitVoting(stoppingToken); if it returns false, set _voteState = Idle and return (vote canceled). 10) maxVotes = max of w.Votes in _availablePresets; presets = all PresetChoice where Votes == maxVotes; winner = random from presets. 11) If winner.Preset equals last.Type, or (maxVotes == 0 and !ChangePresetWithoutVotes): broadcast "Staying on track for {IntervalMinutes} more minutes.". 12) Else: broadcast winner and "Track will change in ..."; await Delay(TransitionDelayMilliseconds); call _presetManager.SetPreset(PresetData(last.Type, winner.Preset, TransitionDurationSeconds)). 13) Set _voteState = Idle.
+    /// 1) If _voteState != Idle, return immediately. 2) Set _voteState = TimerVote. 3) last = _presetManager.CurrentPreset. 4) Clear _availablePresets and _alreadyVoted. 5) presetsLeft = copy of _publicPresetsOrdered with last.Type removed (so we only offer other presets). If presetsLeft.Count == 0: log "Not enough presets", set Idle, return. If presetsLeft.Count == 1: log and broadcast "only one other preset, changing without a vote", delay and SetPreset, set Idle, return. 6) If EnableVote or manualVote: broadcast "Vote for next track:". 7) If EnableStayOnTrack: add PresetChoice(last.Type, Votes=0) to _availablePresets; if voting enabled broadcast " /vt 0 - Stay on current track.". 8) For i from _availablePresets.Count to VoteChoices-1: if presetsLeft empty break; nextPreset = random from presetsLeft; add PresetChoice(nextPreset, 0) to _availablePresets; remove nextPreset from presetsLeft; if voting enabled broadcast " /vt {i} - {nextPreset.Name}". 9) If EnableVote or manualVote: await WaitVoting(stoppingToken); if it returns false, set _voteState = Idle and return (vote canceled). 10) maxVotes = max of w.Votes in _availablePresets; presets = all PresetChoice where Votes == maxVotes; winner = random from presets. 11) If winner.Preset equals last.Type, or (maxVotes == 0 and !ChangePresetWithoutVotes): broadcast "Staying on track for {IntervalMinutes} more minutes.". 12) Else: broadcast winner and "Track will change in ..."; await Delay(TransitionDelayMilliseconds); call _presetManager.SetPreset(PresetData(last.Type, winner.Preset, TransitionDurationSeconds)). 13) Set _voteState = Idle.
     /// </summary>
     private async Task VotingAsync(CancellationToken stoppingToken, bool manualVote = false)
     {
@@ -675,7 +692,7 @@ public class VotingPresetPlugin : BackgroundService
         _availablePresets.Clear();
         _alreadyVoted.Clear();
 
-        var presetsLeft = new List<PresetType>(_votePresets);
+        var presetsLeft = new List<PresetType>(_publicPresetsOrdered);
         presetsLeft.RemoveAll(t => t.Equals(last.Type!));
         if (presetsLeft.Count == 0)
         {

@@ -12,7 +12,7 @@
 /// - voteend (admin): set finish flag so vote ends and result is applied via _votingPreset.FinishVote(Context).
 /// - votecancel (admin): cancel whatever vote is running (timer or on-demand) via _votingPreset.CancelCurrentVote(Context).
 /// - votetimeadd (admin, int seconds): add seconds to vote window via _votingPreset.ExtendVote(Context, seconds).
-/// - presetset (admin, int choice): set preset by index via _votingPreset.SetPreset(Context, choice).
+/// - presetset (admin, int choice): set preset by unified index (public presets 0.. then admin-only; same numbering as /presets) via _votingPreset.SetPreset(Context, choice).
 /// - presetrandom (admin): switch to a random other preset via _votingPreset.RandomPreset(Context).
 /// </summary>
 using AssettoServer.Commands;
